@@ -15,7 +15,6 @@ import datetime
 import logging
 import os
 import time
-import urllib.parse
 
 import aiosqlite
 import httpx
@@ -43,6 +42,7 @@ from telegram.ext import (
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_PATH = "users.db"
 CACHE_TTL = 30 * 60  # seconds
 
@@ -216,30 +216,53 @@ def suggest_outfit_fallback(temp: float, code: int, wind: float) -> str:
     return text
 
 
+GEMINI_SYSTEM_PROMPT = (
+    "You are a friendly, practical fashion assistant. "
+    "When given current weather conditions, suggest a specific outfit in exactly one short paragraph "
+    "(2–4 items: top, bottom or dress, footwear, and one optional accessory if truly needed). "
+    "Be concrete — name actual garment types, not vague categories. "
+    "No bullet points, no line breaks, no greetings, no sign-offs. "
+    "Casual, warm tone. Reply in the language the user writes in."
+)
+
+
 async def get_outfit(temp: float, code: int, wind: float, language: str) -> tuple[str, bool]:
-    """Ask Pollinations.ai for a one-paragraph outfit suggestion.
+    """Ask Gemini for a one-paragraph outfit suggestion.
 
     Returns:
         (suggestion_text, is_ai) — is_ai=False when the rule-based fallback was used.
     """
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not set, using fallback")
+        return suggest_outfit_fallback(temp, code, wind), False
+
     condition = WMO.get(code, "unknown conditions")
-    prompt = (
-        f"You are a fashion assistant. Suggest a short outfit (2-3 items) for this weather: "
-        f"{temp:.1f}°C, {condition}, wind {wind:.0f}km/h. "
-        f"Reply in exactly one short paragraph, no lists, no line breaks. "
-        f"Casual tone. Reply in {language}."
+    user_message = (
+        f"Current weather: {temp:.1f}°C, {condition}, wind {wind:.0f} km/h. "
+        f"What should I wear today? Reply in {language}."
     )
-    url = f"https://text.pollinations.ai/{urllib.parse.quote(prompt, safe='')}"
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": user_message}]}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 200},
+    }
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url)
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(url, json=payload)
             response.raise_for_status()
-        text = response.text.strip()
+        text = (
+            response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        )
         if text:
             return text, True
     except Exception as exc:
-        logger.warning("Pollinations unavailable, using fallback: %s", exc)
+        logger.warning("Gemini unavailable, using fallback: %s", exc)
 
     return suggest_outfit_fallback(temp, code, wind), False
 
