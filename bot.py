@@ -402,14 +402,6 @@ def language_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def location_keyboard(lang: str) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton(s("btn_check_outfit", lang))]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-
-
 def outfit_keyboard(lang: str) -> InlineKeyboardMarkup:
     """Main keyboard shown after every outfit reply."""
     return InlineKeyboardMarkup([
