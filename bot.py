@@ -521,7 +521,15 @@ async def _send_outfit(
         return
 
     condition = WMO.get(code, "unknown conditions")
-    header = city_note + f"🌡 {temp:.1f}°C · {condition} · 💨 {wind:.0f} km/h\n\n"
+    
+    # Calculate date for the selected day
+    target_date = datetime.datetime.now(datetime.UTC).date() + datetime.timedelta(days=day)
+    if lang == "Ukrainian":
+        date_str = target_date.strftime("%d.%m.%Y")  # 13.04.2026
+    else:
+        date_str = target_date.strftime("%m/%d/%Y")  # 04/13/2026
+    
+    header = city_note + f"📅 {date_str}\n🌡 {temp:.1f}°C · {condition} · 💨 {wind:.0f} km/h\n\n"
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     suggestion, is_ai = await get_outfit(temp, code, wind, lang)
