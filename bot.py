@@ -57,8 +57,9 @@ logger = logging.getLogger(__name__)
 
 CREDIT = "Made with ❤️ by @mandrockspalace — t.me/mandrockspalace"
 
-# In-memory outfit cache: user_id → (unix_timestamp, suggestion_text)
-outfit_cache: dict[int, tuple[float, str]] = {}
+# In-memory outfit cache: (user_id, day) → (unix_timestamp, suggestion_text)
+# day: 0=today, 1=tomorrow, 2=day after tomorrow, 3=day after that
+outfit_cache: dict[tuple[int, int], tuple[float, str]] = {}
 
 # ── i18n strings ──────────────────────────────────────────────────────────────
 
@@ -66,6 +67,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "English": {
         # buttons
         "btn_check_outfit":      "🌤 Check outfit",
+        "btn_today":             "📅 Today",
+        "btn_tomorrow":          "📅 Tomorrow",
+        "btn_day_after":         "📅 Day after tomorrow",
+        "btn_day_after_after":   "📅 Day after that",
         "btn_update_location":   "📍 Update location",
         "btn_settings":          "⚙️ Settings",
         "btn_share_location":    "📍 Share my location",
@@ -93,10 +98,15 @@ STRINGS: dict[str, dict[str, str]] = {
         "ai_unavailable":        "\n(AI unavailable, showing basic suggestion)",
         "no_loc_inline":         "Open a private chat with the bot first and share your location.",
         "no_loc_inline_title":   "No location saved",
+        "choose_day":            "Which day would you like to check?",
     },
     "Ukrainian": {
         # buttons
         "btn_check_outfit":      "🌤 Перевірити образ",
+        "btn_today":             "📅 Сьогодні",
+        "btn_tomorrow":          "📅 Завтра",
+        "btn_day_after":         "📅 Послезавтра",
+        "btn_day_after_after":   "📅 Послепослезавтра",
         "btn_update_location":   "📍 Оновити локацію",
         "btn_settings":          "⚙️ Налаштування",
         "btn_share_location":    "📍 Поділитися локацією",
@@ -124,6 +134,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "ai_unavailable":        "\n(AI недоступний, базова порада)",
         "no_loc_inline":         "Спочатку відкрий приватний чат з ботом та поділися місцем розташування.",
         "no_loc_inline_title":   "Місце не збережено",
+        "choose_day":            "На який день перевірити?",
     },
 }
 
@@ -278,13 +289,17 @@ async def db_delete_user(user_id: int) -> None:
 
 # ── Weather fetching ──────────────────────────────────────────────────────────
 
-async def fetch_weather(lat: float, lon: float) -> tuple[float, int, float]:
-    """Return (temperature °C, WMO code, wind speed km/h) for the current UTC hour."""
+async def fetch_weather(lat: float, lon: float, day: int = 0) -> tuple[float, int, float]:
+    """Return (temperature °C, WMO code, wind speed km/h) for the specified day at current UTC hour.
+    
+    Args:
+        day: 0=today, 1=tomorrow, 2=day after tomorrow, 3=day after that
+    """
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,weathercode,windspeed_10m"
-        "&timezone=UTC&forecast_days=1"
+        "&timezone=UTC&forecast_days=4"
     )
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.get(url)
@@ -292,10 +307,12 @@ async def fetch_weather(lat: float, lon: float) -> tuple[float, int, float]:
 
     hourly = response.json()["hourly"]
     hour = datetime.datetime.now(datetime.UTC).hour
+    # Each day has 24 hourly entries
+    idx = day * 24 + hour
     return (
-        hourly["temperature_2m"][hour],
-        hourly["weathercode"][hour],
-        hourly["windspeed_10m"][hour],
+        hourly["temperature_2m"][idx],
+        hourly["weathercode"][idx],
+        hourly["windspeed_10m"][idx],
     )
 
 
@@ -402,6 +419,21 @@ def language_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def location_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(s("btn_check_outfit", lang))]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+def outfit_reply_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(s("btn_check_outfit", lang))]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def outfit_keyboard(lang: str) -> InlineKeyboardMarkup:
     """Main keyboard shown after every outfit reply."""
     return InlineKeyboardMarkup([
@@ -410,6 +442,16 @@ def outfit_keyboard(lang: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(s("btn_update_location", lang), callback_data="update_location"),
             InlineKeyboardButton(s("btn_settings", lang), callback_data="settings"),
         ],
+    ])
+
+
+def day_selector_keyboard(lang: str) -> InlineKeyboardMarkup:
+    """Keyboard for selecting which day's outfit to check."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(s("btn_today", lang), callback_data="day_0")],
+        [InlineKeyboardButton(s("btn_tomorrow", lang), callback_data="day_1")],
+        [InlineKeyboardButton(s("btn_day_after", lang), callback_data="day_2")],
+        [InlineKeyboardButton(s("btn_day_after_after", lang), callback_data="day_3")],
     ])
 
 
@@ -437,9 +479,12 @@ async def _send_outfit(
     user_id: int,
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
+    day: int = 0,
 ) -> None:
     """Fetch weather + suggestion, apply cache, and send via reply_fn.
 
+    Args:
+        day: 0=today, 1=tomorrow, 2=day after tomorrow, 3=day after that
     If the user has no saved location, a random megacity is used.
     """
     user = await db_get_user(user_id)
@@ -454,7 +499,8 @@ async def _send_outfit(
         city_note = s("no_loc_note", lang, city=city)
 
     # ── Cache hit ─────────────────────────────────────────────────────────────
-    cached = outfit_cache.get(user_id)
+    cache_key = (user_id, day)
+    cached = outfit_cache.get(cache_key)
     if cached and not city_note:  # skip cache when using random city
         cached_at, cached_text = cached
         age = time.time() - cached_at
@@ -468,7 +514,7 @@ async def _send_outfit(
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
     try:
-        temp, code, wind = await fetch_weather(lat, lon)
+        temp, code, wind = await fetch_weather(lat, lon, day=day)
     except Exception as exc:
         logger.error("Weather fetch failed for user %d: %s", user_id, exc)
         await reply_fn(s("weather_error", lang))
@@ -487,7 +533,7 @@ async def _send_outfit(
 
     # Only cache when using the real saved location
     if not city_note:
-        outfit_cache[user_id] = (time.time(), full_text)
+        outfit_cache[cache_key] = (time.time(), full_text)
 
     await reply_fn(full_text, reply_markup=outfit_keyboard(lang))
 
@@ -599,11 +645,28 @@ async def callback_language(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def callback_check_outfit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    user = await db_get_user(query.from_user.id)
+    lang = user["language"] if user else "English"
+    await query.edit_message_text(
+        s("choose_day", lang),
+        reply_markup=day_selector_keyboard(lang),
+    )
+
+
+async def callback_select_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle day selection (day_0, day_1, day_2, day_3)."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract day number from callback_data (e.g., "day_0" -> 0)
+    day = int(query.data.split("_")[1])
+    
     await _send_outfit(
         query.message.reply_text,
         query.from_user.id,
         query.message.chat_id,
         context,
+        day=day,
     )
 
 
@@ -696,7 +759,9 @@ async def callback_confirm_del_loc(update: Update, context: ContextTypes.DEFAULT
     lang = user["language"] if user else "English"
 
     await db_clear_location(user_id)
-    outfit_cache.pop(user_id, None)
+    # Clear all cached outfits for this user (all days)
+    for day in range(4):
+        outfit_cache.pop((user_id, day), None)
     logger.info("Cleared location for user %d", user_id)
 
     await query.edit_message_text(
@@ -713,7 +778,9 @@ async def callback_confirm_del_data(update: Update, context: ContextTypes.DEFAUL
     lang = user["language"] if user else "English"
 
     await db_delete_user(user_id)
-    outfit_cache.pop(user_id, None)
+    # Clear all cached outfits for this user (all days)
+    for day in range(4):
+        outfit_cache.pop((user_id, day), None)
     logger.info("Deleted all data for user %d", user_id)
 
     await query.edit_message_text(s("data_deleted", lang))
@@ -726,7 +793,9 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
 
     await db_set_location(user_id, location.latitude, location.longitude)
-    outfit_cache.pop(user_id, None)
+    # Clear all cached outfits for this user (all days)
+    for day in range(4):
+        outfit_cache.pop((user_id, day), None)
     logger.info("Saved location for user %d: %.4f, %.4f", user_id, location.latitude, location.longitude)
 
     user = await db_get_user(user_id)
@@ -769,7 +838,8 @@ async def inline_outfit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lat, lon = user["latitude"], user["longitude"]
     result_text: str
 
-    cached = outfit_cache.get(user_id)
+    cache_key = (user_id, 0)  # inline mode always shows today
+    cached = outfit_cache.get(cache_key)
     if cached:
         cached_at, cached_text = cached
         age = time.time() - cached_at
@@ -781,14 +851,14 @@ async def inline_outfit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if not cached:
         try:
-            temp, code, wind = await fetch_weather(lat, lon)
+            temp, code, wind = await fetch_weather(lat, lon, day=0)
             condition = WMO.get(code, "unknown conditions")
             header = f"🌡 {temp:.1f}°C · {condition} · 💨 {wind:.0f} km/h\n\n"
             suggestion, is_ai = await get_outfit(temp, code, wind, lang)
             if not is_ai:
                 suggestion += s("ai_unavailable", lang)
             result_text = header + suggestion
-            outfit_cache[user_id] = (time.time(), result_text)
+            outfit_cache[cache_key] = (time.time(), result_text)
         except Exception as exc:
             logger.error("Inline outfit failed for user %d: %s", user_id, exc)
             result_text = s("weather_error", lang)
@@ -841,6 +911,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(callback_language,           pattern="^lang_"))
     # main outfit keyboard
     app.add_handler(CallbackQueryHandler(callback_check_outfit,       pattern="^check_outfit$"))
+    app.add_handler(CallbackQueryHandler(callback_select_day,         pattern="^day_[0-3]$"))
     app.add_handler(CallbackQueryHandler(callback_update_location,    pattern="^update_location$"))
     # settings navigation
     app.add_handler(CallbackQueryHandler(callback_settings,           pattern="^settings$"))
