@@ -404,7 +404,7 @@ def language_keyboard() -> InlineKeyboardMarkup:
 
 def location_keyboard(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(s("btn_share_location", lang), request_location=True)]],
+        [[KeyboardButton(s("btn_check_outfit", lang), request_location=True)]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
